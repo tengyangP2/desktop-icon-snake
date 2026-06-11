@@ -1,0 +1,192 @@
+import win32gui
+import win32process
+import win32api
+import win32con
+import commctrl
+import ctypes
+import struct
+import time
+import random
+
+# ----------------- 开启全局高 DPI 感知（拒绝 Windows 虚拟缩放） -----------------
+try:
+    # 强制让 Python 进程使用物理像素坐标系 (Per-Monitor DPI Aware)
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass # 如果系统不支持则跳过
+
+# ----------------- Windows 底层句柄获取 -----------------
+def get_desktop_listview():
+    """获取桌面图标的 SysListView32 句柄"""
+    hwnd = win32gui.FindWindow("Progman", "Program Manager")
+    hwnd = win32gui.FindWindowEx(hwnd, 0, "SHELLDLL_DefView", None)
+    hwnd = win32gui.FindWindowEx(hwnd, 0, "SysListView32", None)
+    if not hwnd:
+        hwnd = win32gui.FindWindow("WorkerW", None)
+        while hwnd:
+            h_def = win32gui.FindWindowEx(hwnd, 0, "SHELLDLL_DefView", None)
+            if h_def:
+                hwnd = win32gui.FindWindowEx(h_def, 0, "SysListView32", None)
+                break
+            hwnd = win32gui.FindWindowEx(0, hwnd, "WorkerW", None)
+    return hwnd
+
+# ----------------- 核心逻辑 -----------------
+def main():
+    hwnd = get_desktop_listview()
+    if not hwnd:
+        print("无法获取桌面句柄，请确保你在 Windows 系统下运行。")
+        return
+
+    icon_count = win32gui.SendMessage(hwnd, commctrl.LVM_GETITEMCOUNT, 0, 0)
+    if icon_count < 5:
+        print("桌面图标太少啦（至少需要5个），多建几个文件夹再试吧！")
+        return
+
+    print(f"检测到桌面共有 {icon_count} 个图标。正在备份位置...")
+
+    # 1. 备份原始位置
+    original_positions = {}
+    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+    
+    process_handle = ctypes.windll.kernel32.OpenProcess(0x38, False, pid)
+    remote_mem = ctypes.windll.kernel32.VirtualAllocEx(process_handle, 0, 8, 0x1000, 0x4)
+
+    for i in range(icon_count):
+        win32gui.SendMessage(hwnd, commctrl.LVM_GETITEMPOSITION, i, remote_mem)
+        loc = struct.pack('ii', 0, 0)
+        ctypes.windll.kernel32.ReadProcessMemory(process_handle, remote_mem, loc, 8, None)
+        x, y = struct.unpack('ii', loc)
+        original_positions[i] = (x, y)
+
+    ctypes.windll.kernel32.VirtualFreeEx(process_handle, remote_mem, 0, 0x8000)
+    ctypes.windll.kernel32.CloseHandle(process_handle)
+    
+    # ----------------- 真实分辨率检测 -----------------
+    screen_width = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+    screen_height = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
+    print(f"【成功解封】已成功捕获真实的 4K/高分屏 物理分辨率：{screen_width} x {screen_height}")
+    
+    grid_size = 100 
+    # 计算食物可生成的最大网格边界 (边缘留出安全空隙)
+    max_grid_x = (screen_width - grid_size) // grid_size
+    max_grid_y = (screen_height - grid_size) // grid_size
+    # ----------------------------------------------------------------
+
+    # 2. 游戏变量与“图标池”初始化
+    # 将初始位置摆在屏幕靠中心的位置
+    start_x = (max_grid_x // 2) * grid_size
+    start_y = (max_grid_y // 2) * grid_size
+    snake_positions = [[start_x, start_y], [start_x - grid_size, start_y], [start_x - grid_size * 2, start_y]]
+    
+    pool = list(range(icon_count))
+    snake_icons = [pool.pop(0) for _ in range(3)] 
+    food_icon = pool.pop(0)
+    food_pos = [start_x + grid_size * 3, start_y]
+
+    direction = 'D'
+    running = True
+
+    try:
+        # 隐藏多余的图标 (藏到真实屏幕外的极远处)
+        for i in pool:
+            win32gui.SendMessage(hwnd, commctrl.LVM_SETITEMPOSITION, i, win32api.MAKELONG(screen_width + 2000, screen_height + 2000))
+        
+        # 摆放初始蛇身和食物
+        for idx, icon_index in enumerate(snake_icons):
+            pos = snake_positions[idx]
+            win32gui.SendMessage(hwnd, commctrl.LVM_SETITEMPOSITION, icon_index, win32api.MAKELONG(pos[0], pos[1]))
+        win32gui.SendMessage(hwnd, commctrl.LVM_SETITEMPOSITION, food_icon, win32api.MAKELONG(food_pos[0], food_pos[1]))
+        win32gui.UpdateWindow(hwnd)
+
+        # 全局按键检测等待
+        print("\n============ 游戏准备就绪 ============")
+        print("操作方式：W(上) A(左) S(下) D(右)")
+        print("退出游戏：随时按 Q 键退出并还原桌面。")
+        print("\n======> 请按 ENTER (回车键) 开始游戏 (无需聚焦此窗口) <======")
+
+        started = False
+        while not started:
+            if win32api.GetAsyncKeyState(0x0D) & 0x8000: 
+                started = True
+                print("游戏开始！")
+            elif win32api.GetAsyncKeyState(ord('Q')) & 0x8000:
+                print("取消游戏，正在还原...")
+                running = False
+                break
+            time.sleep(0.05)
+
+        # 3. 游戏主循环
+        while running:
+            # 高频输入缓冲 (无聚焦盲操)
+            next_direction = direction
+            for _ in range(8):
+                if win32api.GetAsyncKeyState(ord('W')) & 0x8000 and direction != 'S': next_direction = 'W'
+                elif win32api.GetAsyncKeyState(ord('S')) & 0x8000 and direction != 'W': next_direction = 'S'
+                elif win32api.GetAsyncKeyState(ord('A')) & 0x8000 and direction != 'D': next_direction = 'A'
+                elif win32api.GetAsyncKeyState(ord('D')) & 0x8000 and direction != 'A': next_direction = 'D'
+                elif win32api.GetAsyncKeyState(ord('Q')) & 0x8000: 
+                    running = False
+                    break
+                time.sleep(0.05)
+            
+            if not running: break
+            direction = next_direction
+
+            # 计算新蛇头坐标
+            new_head = list(snake_positions[0])
+            if direction == 'W': new_head[1] -= grid_size
+            elif direction == 'S': new_head[1] += grid_size
+            elif direction == 'A': new_head[0] -= grid_size
+            elif direction == 'D': new_head[0] += grid_size
+
+            # ----------------- 动态精准边界碰撞判定 -----------------
+            if new_head[0] < -20 or new_head[0] > screen_width - 20 or new_head[1] < -20 or new_head[1] > screen_height - 20:
+                print(f"\n撞墙了！出界坐标：{new_head}，真实屏幕极限：{screen_width}x{screen_height}")
+                break
+            # --------------------------------------------------------
+                
+            # 咬到自己判定
+            if new_head in snake_positions:
+                print("\n咬到自己了！游戏结束。")
+                break
+
+            snake_positions.insert(0, new_head)
+
+            # 吞噬与成长逻辑
+            if abs(new_head[0] - food_pos[0]) < 50 and abs(new_head[1] - food_pos[1]) < 50:
+                snake_icons.append(food_icon)
+                
+                if len(pool) > 0:
+                    food_icon = pool.pop(0)
+                    # 采用解除束缚后的 4K 网格上限随机刷新食物
+                    while True:
+                        food_pos = [random.randint(1, max_grid_x) * grid_size, random.randint(1, max_grid_y) * grid_size]
+                        if food_pos not in snake_positions: break
+                        
+                    win32gui.SendMessage(hwnd, commctrl.LVM_SETITEMPOSITION, food_icon, win32api.MAKELONG(food_pos[0], food_pos[1]))
+                else:
+                    print("\n太强了！你吃光了所有的桌面图标！游戏通关！")
+                    break
+            else:
+                snake_positions.pop()
+
+            # 刷新位置
+            for idx, icon_index in enumerate(snake_icons):
+                pos = snake_positions[idx]
+                win32gui.SendMessage(hwnd, commctrl.LVM_SETITEMPOSITION, icon_index, win32api.MAKELONG(pos[0], pos[1]))
+
+            win32gui.UpdateWindow(hwnd)
+
+    finally:
+        print("\n正在还原桌面图标，请稍候...")
+        for i, (orig_x, orig_y) in original_positions.items():
+            win32gui.SendMessage(hwnd, commctrl.LVM_SETITEMPOSITION, i, win32api.MAKELONG(orig_x, orig_y))
+        win32gui.InvalidateRect(hwnd, None, True)
+        print("桌面已完全还原！感谢游玩！")
+
+if __name__ == "__main__":
+    main()
